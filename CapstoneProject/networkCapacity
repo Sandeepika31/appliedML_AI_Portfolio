@@ -1,0 +1,628 @@
+# -*- coding: utf-8 -*-
+"""
+capstone_ml_capacity_project.py
+================================
+CAPSTONE ML PROJECT — Capacity Expansion Candidate Prediction
+
+This script REUSES the cell-level KPI dataset produced by
+`r_project_analysis_v2_prb_phase3.py` (the "r_cell_info_merged_*.csv" file)
+and turns it into a complete, textbook end-to-end Machine-Learning
+pre-processing + modelling pipeline, covering the three techniques the
+capstone specifically asks for:
+
+    1. Missing-value & data-inconsistency handling   (STEP 3)
+    2. Train / Test split methodology                (STEP 6)
+    3. Categorical encoding techniques for ML models  (STEP 5)
+
+...plus a full workflow around them (EDA, target engineering, baseline
+model training & evaluation) so the result is a genuine, runnable
+capstone deliverable rather than just a cleaning script.
+
+Pipeline
+--------
+STEP 1  Load baseline cell-level dataset (output of phase3 pipeline)
+STEP 2  Missing-value / inconsistency AUDIT (before cleaning)
+STEP 3  DATA CLEANING
+          3a. Remove exact duplicate rows
+          3b. Remove duplicate Cell Name rows
+          3c. Fix out-of-range / impossible values -> NaN
+          3d. Standardise categorical text (trim, unify blanks)
+          3e. Impute missing values
+                - numeric      -> median imputation (SimpleImputer)
+                - categorical  -> mode / 'Unknown' imputation
+          3f. Outlier capping (IQR method) on key KPIs
+STEP 4  FEATURE ENGINEERING — define the ML target
+          Capacity_Expansion_Needed = 1 if Avg DL PRB Util > threshold else 0
+          + CQI_bin (ordinal bucket of Avg CQI)
+STEP 5  ENCODING TECHNIQUES
+          - One-Hot Encoding       -> nominal categorical features
+                                      (ClutterType, TYPE, O-RU, Region, ...)
+          - Ordinal/Label Encoding -> CQI_bin (has a natural order)
+          - StandardScaler         -> numeric features
+STEP 6  TRAIN / TEST SPLIT (stratified, 80/20, reproducible random_state)
+STEP 7  BASELINE MODEL TRAINING (Logistic Regression + Random Forest)
+STEP 8  MODEL EVALUATION (accuracy / precision / recall / F1 / ROC-AUC,
+         confusion matrix, feature importance)
+STEP 9  SAVE ARTIFACTS (cleaned data, train/test CSVs, encoders, models,
+         plots) for reuse in downstream notebooks / deployment.
+
+Input
+-----
+  r_cell_info_merged_*.csv   (produced by r_project_analysis_v2_prb_phase3.py)
+  falls back to r_cell_info_merged.csv (produced by data_cleaning_BBH.py)
+
+Usage
+-----
+    python capstone_ml_capacity_project.py
+"""
+
+import os
+import glob
+import datetime
+import warnings
+
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    roc_auc_score, roc_curve, confusion_matrix, classification_report,
+)
+
+try:
+    import joblib
+    HAS_JOBLIB = True
+except ImportError:
+    HAS_JOBLIB = False
+    warnings.warn("joblib not available - model/encoder artifacts will not be pickled.")
+
+
+# =============================================================================
+# CONFIGURATION  <- edit these
+# =============================================================================
+
+DATA_DIR = r'C:\KPI Dump (March to Sep)-selected\raw_data'
+
+_ts         = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+OUTPUT_DIR  = os.path.join(DATA_DIR, f'capstone_ml_{_ts}')
+PLOTS_DIR   = os.path.join(OUTPUT_DIR, 'plots')
+os.makedirs(PLOTS_DIR, exist_ok=True)
+
+# Business threshold used to engineer the ML target (consistent with
+# r_capacity_forecast.py / capacity_expansion_end_to_end.py)
+PRB_CAPACITY_THRESHOLD = 70.0   # %
+
+TEST_SIZE    = 0.20
+RANDOM_STATE = 42
+
+print("=" * 70)
+print("capstone_ml_capacity_project.py")
+print("=" * 70)
+print(f"  DATA_DIR    : {DATA_DIR}")
+print(f"  OUTPUT_DIR  : {OUTPUT_DIR}")
+print(f"  PRB threshold target : {PRB_CAPACITY_THRESHOLD}%")
+print(f"  Test size   : {TEST_SIZE}")
+
+
+def save_fig(filename):
+    fpath = os.path.join(PLOTS_DIR, filename)
+    plt.savefig(fpath, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved plot: {filename}")
+
+
+# =============================================================================
+# STEP 1 — LOAD BASELINE CELL-LEVEL DATASET (phase3 output)
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("STEP 1 - Loading baseline cell-level dataset (phase3 output)")
+print("=" * 70)
+
+candidates = sorted(glob.glob(os.path.join(DATA_DIR, 'r_cell_info_merged_*.csv')))
+SRC_FILE = candidates[-1] if candidates else os.path.join(DATA_DIR, 'r_cell_info_merged.csv')
+
+if not os.path.exists(SRC_FILE):
+    raise FileNotFoundError(
+        f"Could not find r_cell_info_merged*.csv in {DATA_DIR}\n"
+        f"Run data_cleaning_BBH.py and/or r_project_analysis_v2_prb_phase3.py first."
+    )
+
+print(f"  Source file : {SRC_FILE}")
+df_raw = pd.read_csv(SRC_FILE, low_memory=False)
+df_raw.columns = df_raw.columns.str.strip()
+print(f"  Shape       : {df_raw.shape}")
+print(f"  Columns     : {df_raw.columns.tolist()}")
+
+
+# =============================================================================
+# STEP 2 — MISSING-VALUE / INCONSISTENCY AUDIT  (BEFORE cleaning)
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("STEP 2 - Missing-value & inconsistency audit (raw data)")
+print("=" * 70)
+
+n_dupe_rows  = df_raw.duplicated().sum()
+n_dupe_cells = df_raw.duplicated(subset=['Cell Name']).sum() if 'Cell Name' in df_raw.columns else 0
+print(f"  Exact duplicate rows        : {n_dupe_rows:,}")
+print(f"  Duplicate 'Cell Name' rows  : {n_dupe_cells:,}")
+
+missing_report = (
+    df_raw.isna().sum()
+    .to_frame('n_missing')
+    .assign(pct_missing=lambda d: 100 * d['n_missing'] / len(df_raw))
+    .sort_values('n_missing', ascending=False)
+)
+print("\n  Missing values per column:")
+print(missing_report[missing_report['n_missing'] > 0].to_string())
+
+print("\n  Numeric column summary (look for impossible / inconsistent values):")
+print(df_raw.select_dtypes(include=[np.number]).describe().T.to_string())
+
+
+# =============================================================================
+# STEP 3 — DATA CLEANING  (missing values + inconsistencies)
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("STEP 3 - Data cleaning (missing values + inconsistencies)")
+print("=" * 70)
+
+df = df_raw.copy()
+
+# 3a. Remove exact duplicate rows ---------------------------------------------
+before = len(df)
+df = df.drop_duplicates()
+print(f"  3a. Exact duplicate rows removed       : {before - len(df):,}  "
+      f"({before:,} -> {len(df):,})")
+
+# 3b. Remove duplicate Cell Name rows (keep first) ----------------------------
+if 'Cell Name' in df.columns:
+    before = len(df)
+    df = df.drop_duplicates(subset=['Cell Name'], keep='first')
+    print(f"  3b. Duplicate 'Cell Name' rows removed : {before - len(df):,}  "
+          f"({before:,} -> {len(df):,})")
+
+# 3c. Fix out-of-range / impossible values -> NaN ------------------------------
+RANGE_RULES = {
+    'Average CQI Last 30 Days'        : (0, 15),
+    'Average DL PRB Util Last 30 Days': (0, 100),
+    'Average Act Users Last 30 Days'  : (0, None),
+    'Average TA Last 30 Days'         : (0, None),
+    'Average DL Usr Tput Last 30 Days': (0, None),
+    'Average DL Vol GB Last 30 Days'  : (0, None),
+    'BW_MHz'                          : (0, 100),
+}
+print("\n  3c. Range-validity checks (invalid -> NaN):")
+for col, (lo, hi) in RANGE_RULES.items():
+    if col not in df.columns:
+        continue
+    mask_bad = pd.Series(False, index=df.index)
+    if lo is not None:
+        mask_bad |= df[col] < lo
+    if hi is not None:
+        mask_bad |= df[col] > hi
+    mask_bad &= df[col].notna()
+    n_bad = int(mask_bad.sum())
+    if n_bad > 0:
+        print(f"      {col:<38s}: {n_bad:,} values outside [{lo}, {hi}] -> set to NaN")
+        df.loc[mask_bad, col] = np.nan
+    else:
+        print(f"      {col:<38s}: OK (no out-of-range values)")
+
+# Replace inf / -inf anywhere (another common inconsistency)
+n_inf = np.isinf(df.select_dtypes(include=[np.number])).sum().sum()
+if n_inf > 0:
+    print(f"\n  3c. Replacing {n_inf:,} +/-inf values with NaN")
+    df = df.replace([np.inf, -np.inf], np.nan)
+
+# 3d. Standardise categorical text (trim whitespace, unify blanks) ------------
+categorical_candidates = [
+    'ClutterType', 'TYPE', 'O-RU', 'Cluster', 'Zone', 'City',
+    'Prefecture', 'Region', 'TMH / nTMH',
+]
+categorical_cols = [c for c in categorical_candidates if c in df.columns]
+print(f"\n  3d. Standardising {len(categorical_cols)} categorical columns "
+      f"(trim + unify blanks -> NaN): {categorical_cols}")
+for col in categorical_cols:
+    df[col] = df[col].astype(str).str.strip()
+    df[col] = df[col].replace({'': np.nan, 'nan': np.nan, 'None': np.nan, 'NaT': np.nan})
+
+# 3e. Impute missing values ----------------------------------------------------
+numeric_candidates = [
+    'Average Act Users Last 30 Days', 'Average CQI Last 30 Days',
+    'Average TA Last 30 Days', 'Average DL Usr Tput Last 30 Days',
+    'Average DL PRB Util Last 30 Days', 'Average DL Vol GB Last 30 Days',
+    'BW_MHz', 'Latitude', 'Longitude',
+]
+numeric_cols = [c for c in numeric_candidates if c in df.columns]
+
+print(f"\n  3e. Imputing missing values:")
+print(f"      Numeric columns ({len(numeric_cols)}) -> median imputation")
+if numeric_cols:
+    before_na = int(df[numeric_cols].isna().sum().sum())
+    num_imputer = SimpleImputer(strategy='median')
+    df[numeric_cols] = num_imputer.fit_transform(df[numeric_cols])
+    print(f"        {before_na:,} missing numeric values imputed")
+
+print(f"      Categorical columns ({len(categorical_cols)}) -> mode / 'Unknown' imputation")
+for col in categorical_cols:
+    n_missing = int(df[col].isna().sum())
+    if n_missing == 0:
+        continue
+    mode_vals = df[col].mode(dropna=True)
+    fill_val  = mode_vals.iloc[0] if not mode_vals.empty else 'Unknown'
+    df[col] = df[col].fillna(fill_val)
+    print(f"        {col:<15s}: {n_missing:,} missing -> filled with '{fill_val}'")
+
+# 3f. Outlier capping (IQR method) on key KPIs ---------------------------------
+def cap_outliers_iqr(series, k=1.5):
+    q1, q3 = series.quantile([0.25, 0.75])
+    iqr    = q3 - q1
+    lo, hi = q1 - k * iqr, q3 + k * iqr
+    return series.clip(lower=lo, upper=hi), lo, hi
+
+outlier_cols = [c for c in [
+    'Average DL Usr Tput Last 30 Days', 'Average TA Last 30 Days',
+    'Average Act Users Last 30 Days', 'Average DL Vol GB Last 30 Days',
+] if c in df.columns]
+
+print(f"\n  3f. Outlier capping (IQR method, k=1.5) on {outlier_cols}:")
+for col in outlier_cols:
+    before_vals = df[col].copy()
+    df[col], lo, hi = cap_outliers_iqr(df[col])
+    n_capped = int((before_vals != df[col]).sum())
+    print(f"      {col:<38s}: bounds [{lo:.2f}, {hi:.2f}]  ->  {n_capped:,} values capped")
+
+print(f"\n  Cleaned dataset shape : {df.shape}")
+print(f"  Remaining missing values (should be 0 for numeric/categorical used above):")
+print(df[numeric_cols + categorical_cols].isna().sum().to_string())
+
+cleaned_csv = os.path.join(OUTPUT_DIR, 'cleaned_dataset.csv')
+df.to_csv(cleaned_csv, index=False)
+print(f"\n  Saved cleaned dataset: {cleaned_csv}")
+
+# ---- Missing-data visual (before vs after) ----------------------------------
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+missing_before = df_raw.isna().mean().sort_values(ascending=False) * 100
+missing_before = missing_before[missing_before > 0]
+if not missing_before.empty:
+    missing_before.plot(kind='bar', ax=axes[0], color='salmon', edgecolor='black')
+axes[0].set_title('Missing % — BEFORE cleaning')
+axes[0].set_ylabel('% missing')
+axes[0].tick_params(axis='x', rotation=75)
+
+missing_after = df.isna().mean().sort_values(ascending=False) * 100
+missing_after = missing_after[missing_after > 0]
+if not missing_after.empty:
+    missing_after.plot(kind='bar', ax=axes[1], color='seagreen', edgecolor='black')
+else:
+    axes[1].text(0.5, 0.5, 'No missing values remain', ha='center', va='center',
+                 transform=axes[1].transAxes, fontsize=12)
+axes[1].set_title('Missing % — AFTER cleaning')
+axes[1].set_ylabel('% missing')
+axes[1].tick_params(axis='x', rotation=75)
+plt.tight_layout()
+save_fig('missing_values_before_after.png')
+
+
+# =============================================================================
+# STEP 4 — FEATURE ENGINEERING: DEFINE THE ML TARGET
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("STEP 4 - Feature engineering (ML target + CQI bucket)")
+print("=" * 70)
+
+TARGET_COL = 'Capacity_Expansion_Needed'
+df[TARGET_COL] = (
+    df['Average DL PRB Util Last 30 Days'] > PRB_CAPACITY_THRESHOLD
+).astype(int)
+
+print(f"  Target '{TARGET_COL}' = 1 if Avg DL PRB Util > {PRB_CAPACITY_THRESHOLD}% else 0")
+print(df[TARGET_COL].value_counts().rename('count').to_string())
+print(f"  Positive class ratio: {df[TARGET_COL].mean() * 100:.1f}%")
+
+# Ordinal CQI bucket (useful for ordinal/label encoding demonstration)
+cqi_bins       = [0, 6, 8, 10, 12, 15]
+cqi_bin_labels = ['(0,6]', '(6,8]', '(8,10]', '(10,12]', '(12,15]']
+df['CQI_bin'] = pd.cut(
+    df['Average CQI Last 30 Days'], bins=cqi_bins, labels=cqi_bin_labels,
+    right=True, include_lowest=True,
+).astype(str)
+df['CQI_bin'] = df['CQI_bin'].replace({'nan': 'Unknown'})
+print(f"\n  CQI_bin distribution:")
+print(df['CQI_bin'].value_counts().to_string())
+
+DEGENERATE_TARGET = df[TARGET_COL].nunique() < 2
+if DEGENERATE_TARGET:
+    warnings.warn(
+        "Target has only one class in this dataset - stratified split and "
+        "classification metrics below will be degenerate. Consider lowering "
+        "PRB_CAPACITY_THRESHOLD or using a larger dataset."
+    )
+
+
+# =============================================================================
+# STEP 5 — ENCODING TECHNIQUES FOR ML MODELS
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("STEP 5 - Encoding categorical features")
+print("=" * 70)
+
+# ---- Ordinal / Label Encoding — CQI_bin has a natural order -----------------
+cqi_order = cqi_bin_labels + ['Unknown']
+cqi_map   = {label: idx for idx, label in enumerate(cqi_order)}
+df['CQI_bin_encoded'] = df['CQI_bin'].map(cqi_map).fillna(-1).astype(int)
+print(f"  Ordinal/Label Encoding -> CQI_bin_encoded  (mapping: {cqi_map})")
+
+# ---- Nominal categorical columns -> One-Hot Encoding -------------------------
+nominal_cat_cols = [c for c in [
+    'ClutterType', 'TYPE', 'O-RU', 'Zone', 'City', 'Prefecture',
+    'Region', 'TMH / nTMH',
+] if c in df.columns]
+print(f"  One-Hot Encoding -> {nominal_cat_cols}")
+
+# ---- Numeric (continuous) feature columns -> StandardScaler -----------------
+numeric_feature_cols = [c for c in [
+    'Average Act Users Last 30 Days', 'Average CQI Last 30 Days',
+    'Average TA Last 30 Days', 'Average DL Vol GB Last 30 Days',
+    'BW_MHz', 'CQI_bin_encoded',
+] if c in df.columns]
+print(f"  StandardScaler -> {numeric_feature_cols}")
+
+# NOTE: 'Average DL PRB Util Last 30 Days' and 'Average DL Usr Tput Last 30 Days'
+# are excluded from the feature set because they directly determine / leak the
+# target variable (data-leakage avoidance - a key ML hygiene practice).
+feature_cols = numeric_feature_cols + nominal_cat_cols
+X = df[feature_cols].copy()
+y = df[TARGET_COL].copy()
+
+print(f"\n  Feature matrix X shape : {X.shape}")
+print(f"  Target vector y shape  : {y.shape}")
+print(f"  Feature columns        : {feature_cols}")
+
+# Build a reusable ColumnTransformer that bundles:
+#   - StandardScaler on numeric columns
+#   - OneHotEncoder  on nominal categorical columns
+# (CQI_bin_encoded is already numeric/ordinal so it rides through the
+#  numeric-scaler branch above — demonstrating ordinal encoding is a
+#  distinct, separate step from one-hot encoding.)
+preprocessor = ColumnTransformer(
+    transformers=[
+        ('num', StandardScaler(), numeric_feature_cols),
+        ('cat', OneHotEncoder(handle_unknown='ignore', sparse_output=False), nominal_cat_cols),
+    ],
+    remainder='drop',
+)
+
+
+# =============================================================================
+# STEP 6 — TRAIN / TEST SPLIT
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("STEP 6 - Train / Test split")
+print("=" * 70)
+
+stratify_arg = y if (not DEGENERATE_TARGET and y.value_counts().min() >= 2) else None
+if stratify_arg is None:
+    print("  WARNING: cannot stratify (target has <2 samples in a class) - "
+          "falling back to a plain random split.")
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y,
+    test_size=TEST_SIZE,
+    random_state=RANDOM_STATE,
+    stratify=stratify_arg,
+)
+
+print(f"  Train set : X={X_train.shape}  y={y_train.shape}  "
+      f"(positive rate: {y_train.mean()*100:.1f}%)")
+print(f"  Test set  : X={X_test.shape}   y={y_test.shape}  "
+      f"(positive rate: {y_test.mean()*100:.1f}%)")
+
+# Save train/test splits (raw, pre-encoding) for reuse / auditing
+train_df = X_train.copy(); train_df[TARGET_COL] = y_train.values
+test_df  = X_test.copy();  test_df[TARGET_COL]  = y_test.values
+train_csv = os.path.join(OUTPUT_DIR, 'train_set.csv')
+test_csv  = os.path.join(OUTPUT_DIR, 'test_set.csv')
+train_df.to_csv(train_csv, index=False)
+test_df.to_csv(test_csv, index=False)
+print(f"  Saved: {train_csv}")
+print(f"  Saved: {test_csv}")
+
+# ---- Fit preprocessor on TRAIN ONLY, transform both train & test ------------
+# (Fitting only on train avoids leaking test-set statistics into scaling /
+#  encoding — a core train/test-split best practice.)
+X_train_enc = preprocessor.fit_transform(X_train)
+X_test_enc  = preprocessor.transform(X_test)
+
+encoded_feature_names = (
+    numeric_feature_cols +
+    list(preprocessor.named_transformers_['cat'].get_feature_names_out(nominal_cat_cols))
+    if nominal_cat_cols else numeric_feature_cols
+)
+print(f"\n  Encoded feature matrix shape (train): {X_train_enc.shape}")
+print(f"  Encoded feature matrix shape (test) : {X_test_enc.shape}")
+print(f"  Total encoded feature count          : {len(encoded_feature_names)}")
+
+
+# =============================================================================
+# STEP 7 — BASELINE MODEL TRAINING
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("STEP 7 - Baseline model training")
+print("=" * 70)
+
+models = {
+    'LogisticRegression': LogisticRegression(max_iter=1000, random_state=RANDOM_STATE),
+    'RandomForest'      : RandomForestClassifier(
+        n_estimators=200, max_depth=8, random_state=RANDOM_STATE, n_jobs=-1
+    ),
+}
+
+trained_models = {}
+for name, clf in models.items():
+    print(f"\n  Training {name} ...")
+    try:
+        clf.fit(X_train_enc, y_train)
+        trained_models[name] = clf
+        print(f"    Done.")
+    except Exception as e:
+        print(f"    SKIPPED ({name}) - training failed: {e}")
+
+
+# =============================================================================
+# STEP 8 — MODEL EVALUATION
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("STEP 8 - Model evaluation")
+print("=" * 70)
+
+eval_rows = []
+
+for name, clf in trained_models.items():
+    print(f"\n  -- {name} " + "-" * 50)
+    y_pred = clf.predict(X_test_enc)
+
+    try:
+        y_proba = clf.predict_proba(X_test_enc)[:, 1]
+    except Exception:
+        y_proba = None
+
+    acc  = accuracy_score(y_test, y_pred)
+    prec = precision_score(y_test, y_pred, zero_division=0)
+    rec  = recall_score(y_test, y_pred, zero_division=0)
+    f1   = f1_score(y_test, y_pred, zero_division=0)
+    try:
+        auc = roc_auc_score(y_test, y_proba) if y_proba is not None and y_test.nunique() > 1 else np.nan
+    except Exception:
+        auc = np.nan
+
+    print(f"    Accuracy  : {acc:.3f}")
+    print(f"    Precision : {prec:.3f}")
+    print(f"    Recall    : {rec:.3f}")
+    print(f"    F1-score  : {f1:.3f}")
+    print(f"    ROC-AUC   : {auc:.3f}" if pd.notna(auc) else "    ROC-AUC   : N/A (single class)")
+    print("\n    Classification report:")
+    print(classification_report(y_test, y_pred, zero_division=0))
+
+    eval_rows.append({
+        'Model': name, 'Accuracy': acc, 'Precision': prec,
+        'Recall': rec, 'F1': f1, 'ROC_AUC': auc,
+    })
+
+    # ---- Confusion matrix plot -----------------------------------------------
+    cm = confusion_matrix(y_test, y_pred)
+    fig, ax = plt.subplots(figsize=(5, 4))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False, ax=ax,
+                xticklabels=['No Expansion', 'Expansion'],
+                yticklabels=['No Expansion', 'Expansion'])
+    ax.set_xlabel('Predicted')
+    ax.set_ylabel('Actual')
+    ax.set_title(f'Confusion Matrix - {name}')
+    plt.tight_layout()
+    save_fig(f'confusion_matrix_{name}.png')
+
+    # ---- ROC curve ------------------------------------------------------------
+    if y_proba is not None and y_test.nunique() > 1:
+        fpr, tpr, _ = roc_curve(y_test, y_proba)
+        fig, ax = plt.subplots(figsize=(5, 5))
+        ax.plot(fpr, tpr, color='darkorange', linewidth=2, label=f'AUC = {auc:.3f}')
+        ax.plot([0, 1], [0, 1], linestyle='--', color='grey')
+        ax.set_xlabel('False Positive Rate')
+        ax.set_ylabel('True Positive Rate')
+        ax.set_title(f'ROC Curve - {name}')
+        ax.legend()
+        plt.tight_layout()
+        save_fig(f'roc_curve_{name}.png')
+
+    # ---- Feature importance (RandomForest only) --------------------------------
+    if hasattr(clf, 'feature_importances_'):
+        importances = pd.Series(clf.feature_importances_, index=encoded_feature_names)
+        importances = importances.sort_values(ascending=False).head(20)
+        fig, ax = plt.subplots(figsize=(9, 7))
+        importances.sort_values().plot(kind='barh', ax=ax, color='teal')
+        ax.set_title(f'Top 20 Feature Importances - {name}')
+        ax.set_xlabel('Importance')
+        plt.tight_layout()
+        save_fig(f'feature_importance_{name}.png')
+
+eval_df = pd.DataFrame(eval_rows)
+print("\n  Model comparison summary:")
+print(eval_df.to_string(index=False))
+
+eval_csv = os.path.join(OUTPUT_DIR, 'model_evaluation_summary.csv')
+eval_df.to_csv(eval_csv, index=False)
+print(f"\n  Saved: {eval_csv}")
+
+
+# =============================================================================
+# STEP 9 — SAVE ARTIFACTS
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("STEP 9 - Saving artifacts")
+print("=" * 70)
+
+if HAS_JOBLIB:
+    preproc_path = os.path.join(OUTPUT_DIR, 'preprocessor.pkl')
+    joblib.dump(preprocessor, preproc_path)
+    print(f"  Saved: {preproc_path}")
+
+    for name, clf in trained_models.items():
+        model_path = os.path.join(OUTPUT_DIR, f'model_{name}.pkl')
+        joblib.dump(clf, model_path)
+        print(f"  Saved: {model_path}")
+else:
+    print("  joblib not available - skipping model/encoder pickling.")
+
+# Save the CQI ordinal map for downstream reuse
+cqi_map_path = os.path.join(OUTPUT_DIR, 'cqi_bin_encoding_map.csv')
+pd.DataFrame(list(cqi_map.items()), columns=['CQI_bin', 'Encoded_Value']).to_csv(
+    cqi_map_path, index=False
+)
+print(f"  Saved: {cqi_map_path}")
+
+
+# =============================================================================
+# FINAL SUMMARY
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("CAPSTONE PIPELINE SUMMARY")
+print("=" * 70)
+print(f"  Source file              : {SRC_FILE}")
+print(f"  Raw rows -> Cleaned rows  : {len(df_raw):,} -> {len(df):,}")
+print(f"  Target                   : {TARGET_COL}  "
+      f"(1 = Avg DL PRB Util > {PRB_CAPACITY_THRESHOLD}%)")
+print(f"  Encoding techniques used :")
+print(f"      - One-Hot Encoding    -> {nominal_cat_cols}")
+print(f"      - Ordinal/Label Enc.  -> CQI_bin  (CQI_bin_encoded)")
+print(f"      - StandardScaler      -> {numeric_feature_cols}")
+print(f"  Train/Test split         : {int((1-TEST_SIZE)*100)}/{int(TEST_SIZE*100)}  "
+      f"(stratified={'Yes' if stratify_arg is not None else 'No'}, "
+      f"random_state={RANDOM_STATE})")
+print(f"  Models trained           : {list(trained_models.keys())}")
+print(f"\n  All outputs saved to     : {OUTPUT_DIR}")
+print(f"  Plots saved to           : {PLOTS_DIR}")
+print("=" * 70)
+print("DONE")
+print("=" * 70)
