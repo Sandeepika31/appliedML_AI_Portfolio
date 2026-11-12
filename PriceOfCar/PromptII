@@ -1,0 +1,600 @@
+# -*- coding: utf-8 -*-
+"""
+What drives the price of a car?
+================================
+
+Practical Application II -- plain Python script version.
+
+This script performs the full CRISP-DM workflow (Business Understanding,
+Data Understanding, Data Preparation, Modeling, Evaluation, Deployment)
+for the used-car pricing dataset. It is a straight port of the companion
+Jupyter notebook (`prompt_II.ipynb`) so that it can be run end-to-end from
+the command line without needing Jupyter:
+
+    python prompt_II.py
+
+All plots are saved as PNG files into the `output_plots/` folder (next to
+this script) instead of being displayed inline, and all tables/print
+statements are written to stdout. Run the script and inspect the console
+output plus the images in `output_plots/` to see the full analysis.
+"""
+
+import os
+import warnings
+
+warnings.filterwarnings('ignore')
+
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use('Agg')  # non-interactive backend so the script runs headless
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, PolynomialFeatures
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LinearRegression, Ridge, Lasso
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+
+pd.set_option('display.max_columns', 100)
+pd.set_option('display.width', 160)
+pd.set_option('display.float_format', lambda x: f'{x:,.2f}')
+
+sns.set_style('darkgrid')
+plt.rcParams['figure.figsize'] = (10, 6)
+
+RANDOM_STATE = 42
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_PATH = os.path.join(SCRIPT_DIR, 'data', 'vehicles.csv')
+PLOT_DIR = os.path.join(SCRIPT_DIR, 'output_plots')
+os.makedirs(PLOT_DIR, exist_ok=True)
+
+
+def savefig(name):
+    """Save the current matplotlib figure to output_plots/<name>.png and close it."""
+    path = os.path.join(PLOT_DIR, name)
+    plt.savefig(path, dpi=120, bbox_inches='tight')
+    plt.close()
+    print(f'[saved plot] {path}')
+
+
+def section(title):
+    print('\n' + '=' * 90)
+    print(title)
+    print('=' * 90)
+
+
+def get_feature_names_compat(transformer, input_features=None):
+    """Compatibility wrapper: newer sklearn uses get_feature_names_out(),
+    older sklearn (<1.0) uses get_feature_names(). Supports both."""
+    if hasattr(transformer, 'get_feature_names_out'):
+        try:
+            return list(transformer.get_feature_names_out(input_features))
+        except TypeError:
+            return list(transformer.get_feature_names_out())
+    # older sklearn API
+    if input_features is not None:
+        return list(transformer.get_feature_names(input_features))
+    return list(transformer.get_feature_names())
+
+
+# ---------------------------------------------------------------------------
+# Business Understanding
+# ---------------------------------------------------------------------------
+section('BUSINESS UNDERSTANDING')
+print("""
+Data problem definition:
+
+Given a historical dataset of ~426,000 used-vehicle listings, each described
+by numeric and categorical attributes (year, odometer, manufacturer, model,
+condition, cylinders, fuel, title_status, transmission, drive, size, type,
+paint_color, region/state) and a continuous target variable `price`, we
+frame this as a SUPERVISED REGRESSION problem: build an interpretable
+regression model (comparing OLS, Ridge, Lasso, and a non-linear benchmark)
+that predicts price as a function of vehicle attributes.
+
+The primary objective is INFERENCE: quantify the marginal effect of each
+feature on price, holding other factors constant, so that statistically
+significant, business-meaningful coefficients can be translated into
+actionable inventory and pricing recommendations for a used-car dealership.
+""")
+
+# ---------------------------------------------------------------------------
+# Data Understanding
+# ---------------------------------------------------------------------------
+section('DATA UNDERSTANDING')
+
+df_raw = pd.read_csv(DATA_PATH)
+print('Shape:', df_raw.shape)
+print(df_raw.head())
+
+print('\n--- df_raw.info() ---')
+df_raw.info()
+
+missing = (df_raw.isna().sum()
+           .to_frame('n_missing')
+           .assign(pct_missing=lambda d: (100 * d['n_missing'] / len(df_raw)).round(1))
+           .sort_values('n_missing', ascending=False))
+print('\n--- Missing values ---')
+print(missing)
+
+fig, ax = plt.subplots(figsize=(10, 6))
+missing[missing['n_missing'] > 0]['pct_missing'].plot(kind='barh', ax=ax, color='salmon')
+ax.set_xlabel('% missing')
+ax.set_title('Missing Value Percentage by Column')
+plt.tight_layout()
+savefig('01_missing_values.png')
+
+print('\n--- price / year / odometer describe() ---')
+print(df_raw[['price', 'year', 'odometer']].describe())
+
+print('\n--- Sanity checks on raw values ---')
+print('price == 0        :', (df_raw['price'] == 0).sum())
+print('price > 150,000   :', (df_raw['price'] > 150000).sum())
+print('price < 500       :', (df_raw['price'] < 500).sum())
+print('odometer > 300,000:', (df_raw['odometer'] > 300000).sum())
+print('year < 1990       :', (df_raw['year'] < 1990).sum())
+print('duplicate id rows :', df_raw['id'].duplicated().sum())
+print('duplicate full rows (excl. id):', df_raw.drop(columns=['id']).duplicated().sum())
+
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+sns.histplot(df_raw.loc[df_raw['price'].between(0, 100000), 'price'], bins=60, ax=axes[0], color='steelblue')
+axes[0].set_title('Price distribution (0 - 100k)')
+
+sns.histplot(df_raw['year'].dropna(), bins=60, ax=axes[1], color='seagreen')
+axes[1].set_title('Year distribution')
+
+sns.histplot(df_raw.loc[df_raw['odometer'] < 400000, 'odometer'], bins=60, ax=axes[2], color='darkorange')
+axes[2].set_title('Odometer distribution (< 400k)')
+plt.tight_layout()
+savefig('02_raw_distributions.png')
+
+cat_cols_overview = ['manufacturer', 'condition', 'cylinders', 'fuel', 'title_status',
+                      'transmission', 'drive', 'size', 'type', 'paint_color']
+print('\n--- Cardinality of categorical columns ---')
+for c in cat_cols_overview:
+    print(f'{c:<15s}  n_unique={df_raw[c].nunique():>4}')
+print(f'{"region":<15s}  n_unique={df_raw["region"].nunique():>4}')
+print(f'{"state":<15s}  n_unique={df_raw["state"].nunique():>4}')
+print(f'{"model":<15s}  n_unique={df_raw["model"].nunique():>4}')
+print(f'{"VIN":<15s}  n_unique={df_raw["VIN"].nunique():>4}')
+
+fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+order = df_raw['condition'].value_counts().index
+sns.boxplot(data=df_raw[df_raw['price'].between(0, 60000)], x='condition', y='price',
+            order=order, ax=axes[0, 0])
+axes[0, 0].set_title('Price by Condition')
+axes[0, 0].tick_params(axis='x', rotation=30)
+
+top_manu = df_raw['manufacturer'].value_counts().head(12).index
+sns.boxplot(data=df_raw[(df_raw['price'].between(0, 60000)) & (df_raw['manufacturer'].isin(top_manu))],
+            x='manufacturer', y='price', order=top_manu, ax=axes[0, 1])
+axes[0, 1].set_title('Price by Manufacturer (Top 12 by count)')
+axes[0, 1].tick_params(axis='x', rotation=45)
+
+sns.scatterplot(data=df_raw.sample(20000, random_state=42), x='odometer', y='price',
+                 alpha=0.2, ax=axes[1, 0])
+axes[1, 0].set_xlim(0, 300000)
+axes[1, 0].set_ylim(0, 100000)
+axes[1, 0].set_title('Price vs. Odometer (sampled)')
+
+sns.scatterplot(data=df_raw.sample(20000, random_state=42), x='year', y='price',
+                 alpha=0.2, ax=axes[1, 1])
+axes[1, 1].set_ylim(0, 100000)
+axes[1, 1].set_title('Price vs. Year (sampled)')
+
+plt.tight_layout()
+savefig('03_price_relationships.png')
+
+print("""
+Observations from Data Understanding:
+- price/year/odometer contain clearly erroneous/extreme values that must be filtered.
+- VIN is a pure identifier (~38% missing) -- not usable as a feature.
+- model/region have very high cardinality -- dropped in favor of manufacturer/state.
+- size/cylinders/condition/drive/paint_color have substantial missingness -- impute as 'unknown'.
+- Clear visual relationships: price falls with odometer, rises with year; condition and
+  manufacturer both show visibly different price distributions -- good candidate predictors.
+""")
+
+# ---------------------------------------------------------------------------
+# Data Preparation
+# ---------------------------------------------------------------------------
+section('DATA PREPARATION')
+
+df = df_raw.copy()
+print('Starting rows:', len(df))
+
+# ---- 1. Drop pure-identifier / excessive-cardinality / redundant columns ----
+df = df.drop(columns=['id', 'VIN', 'model', 'region'])
+print('After dropping id/VIN/model/region:', df.shape)
+
+# ---- 2. Remove rows with missing critical numeric fields -------------------
+before = len(df)
+df = df.dropna(subset=['price', 'year', 'odometer'])
+print(f'Dropped {before - len(df):,} rows missing price/year/odometer -> {len(df):,} rows remain')
+
+# ---- 3. Filter out implausible / outlier values -----------------------------
+before = len(df)
+df = df[(df['price'] >= 500) & (df['price'] <= 150000)]
+print(f'Price filter [500, 150000]: dropped {before - len(df):,} rows -> {len(df):,} remain')
+
+before = len(df)
+df = df[(df['year'] >= 1990) & (df['year'] <= 2022)]
+print(f'Year filter [1990, 2022]: dropped {before - len(df):,} rows -> {len(df):,} remain')
+
+before = len(df)
+df = df[(df['odometer'] >= 0) & (df['odometer'] <= 300000)]
+print(f'Odometer filter [0, 300000]: dropped {before - len(df):,} rows -> {len(df):,} remain')
+
+# ---- 4. Feature engineering --------------------------------------------------
+CURRENT_YEAR = 2022   # dataset vintage (max year observed)
+df['age'] = CURRENT_YEAR - df['year']
+df['miles_per_year'] = df['odometer'] / df['age'].replace(0, 1)
+print('\n--- age / miles_per_year describe() ---')
+print(df[['year', 'age', 'odometer', 'miles_per_year']].describe())
+
+# ---- 5. Impute missing categorical values with an explicit 'unknown' level --
+cat_cols = ['manufacturer', 'condition', 'cylinders', 'fuel', 'title_status',
+            'transmission', 'drive', 'size', 'type', 'paint_color', 'state']
+
+for col in cat_cols:
+    df[col] = df[col].fillna('unknown').astype(str).str.strip()
+
+print('\n--- NA count after imputation (should be 0) ---')
+print(df[cat_cols].isna().sum())
+
+# ---- 6. Simplify 'cylinders' to a numeric feature where possible -----------
+cyl_map = {
+    '3 cylinders': 3, '4 cylinders': 4, '5 cylinders': 5, '6 cylinders': 6,
+    '8 cylinders': 8, '10 cylinders': 10, '12 cylinders': 12,
+    'other': np.nan, 'unknown': np.nan,
+}
+df['cylinders_num'] = df['cylinders'].map(cyl_map)
+df['cylinders_num'] = df['cylinders_num'].fillna(df['cylinders_num'].median())
+print('\n--- cylinders -> cylinders_num mapping ---')
+print(df[['cylinders', 'cylinders_num']].drop_duplicates().sort_values('cylinders_num'))
+
+# ---- 7. Log-transform the (right-skewed) target and odometer ----------------
+df['log_price'] = np.log1p(df['price'])
+df['log_odometer'] = np.log1p(df['odometer'])
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+sns.histplot(df['price'], bins=60, ax=axes[0], color='steelblue')
+axes[0].set_title('Price (raw) -- right-skewed')
+sns.histplot(df['log_price'], bins=60, ax=axes[1], color='seagreen')
+axes[1].set_title('log(1 + Price) -- much closer to normal')
+plt.tight_layout()
+savefig('04_price_log_transform.png')
+
+# ---- 8. Final feature set for modeling --------------------------------------
+numeric_features = ['age', 'log_odometer', 'cylinders_num']
+categorical_features = ['manufacturer', 'condition', 'fuel', 'title_status',
+                         'transmission', 'drive', 'size', 'type', 'paint_color', 'state']
+
+model_df = df[numeric_features + categorical_features + ['log_price', 'price']].copy()
+print('\nFinal modeling dataset shape:', model_df.shape)
+print(model_df.head())
+
+# ---- 9. Train / test split ---------------------------------------------------
+X = model_df[numeric_features + categorical_features]
+y = model_df['log_price']          # model in log-space; inverse-transform for reporting
+y_dollars = model_df['price']      # keep original price aligned for evaluation
+
+X_train, X_test, y_train, y_test, y_train_d, y_test_d = train_test_split(
+    X, y, y_dollars, test_size=0.2, random_state=RANDOM_STATE
+)
+print('\nTrain shape:', X_train.shape, ' Test shape:', X_test.shape)
+
+# ---- 10. Preprocessing pipeline: scale numeric, one-hot encode categorical --
+preprocessor = ColumnTransformer(transformers=[
+    ('num', StandardScaler(), numeric_features),
+    ('cat', OneHotEncoder(handle_unknown='ignore', sparse=True), categorical_features),
+])
+print('\nPreprocessor:', preprocessor)
+
+# ---------------------------------------------------------------------------
+# Modeling
+# ---------------------------------------------------------------------------
+section('MODELING')
+
+print("""
+We model log(1 + price) as the target (rather than raw price) because the
+price distribution is strongly right-skewed; modeling in log-space
+stabilizes variance and makes the linear-model assumptions more reasonable.
+All reported dollar-scale metrics (RMSE, MAE) below are computed after
+inverse-transforming predictions back to raw price (np.expm1).
+
+We compare four regression approaches:
+1. Linear Regression (baseline, no regularization)
+2. Ridge Regression (L2-regularized, tuned via GridSearchCV)
+3. Lasso Regression (L1-regularized, tuned via GridSearchCV)
+4. Random Forest Regressor (non-linear benchmark)
+""")
+
+
+def eval_model(name, pipe, X_tr, y_tr_log, X_te, y_te_log, y_te_dollars):
+    """Fit pipe on train (log target), evaluate in dollar-space on test."""
+    pipe.fit(X_tr, y_tr_log)
+    pred_log_tr = pipe.predict(X_tr)
+    pred_log_te = pipe.predict(X_te)
+
+    pred_dollars_te = np.expm1(pred_log_te)
+
+    r2_log_tr = r2_score(y_tr_log, pred_log_tr)
+    r2_log_te = r2_score(y_te_log, pred_log_te)
+
+    rmse_te = np.sqrt(mean_squared_error(y_te_dollars, pred_dollars_te))
+    mae_te = mean_absolute_error(y_te_dollars, pred_dollars_te)
+    r2_dollar_te = r2_score(y_te_dollars, pred_dollars_te)
+
+    print(f'{name:<20s}  R2(log,train)={r2_log_tr:6.3f}  R2(log,test)={r2_log_te:6.3f}  '
+          f'R2($,test)={r2_dollar_te:6.3f}  RMSE($,test)={rmse_te:9,.0f}  MAE($,test)={mae_te:9,.0f}')
+
+    return {
+        'name': name, 'pipe': pipe,
+        'r2_log_train': r2_log_tr, 'r2_log_test': r2_log_te,
+        'r2_dollar_test': r2_dollar_te, 'rmse_dollar_test': rmse_te, 'mae_dollar_test': mae_te,
+    }
+
+
+results = []
+
+# ---- Model 1: Linear Regression (baseline) ----------------------------------
+lin_pipe = Pipeline([
+    ('prep', preprocessor),
+    ('model', LinearRegression()),
+])
+results.append(eval_model('LinearRegression', lin_pipe, X_train, y_train, X_test, y_test, y_test_d))
+
+# ---- Model 2: Ridge Regression, tuned via GridSearchCV ----------------------
+ridge_pipe = Pipeline([
+    ('prep', preprocessor),
+    ('model', Ridge(random_state=RANDOM_STATE)),
+])
+ridge_param_grid = {'model__alpha': [0.01, 0.1, 1.0, 10.0, 50.0, 100.0]}
+
+ridge_grid = GridSearchCV(ridge_pipe, ridge_param_grid, cv=5, scoring='r2', n_jobs=-1)
+ridge_grid.fit(X_train, y_train)
+
+print('Best Ridge alpha:', ridge_grid.best_params_, '  CV R2:', round(ridge_grid.best_score_, 4))
+results.append(eval_model('Ridge (tuned)', ridge_grid.best_estimator_, X_train, y_train, X_test, y_test, y_test_d))
+
+# ---- Model 3: Lasso Regression, tuned via GridSearchCV ----------------------
+lasso_pipe = Pipeline([
+    ('prep', preprocessor),
+    ('model', Lasso(random_state=RANDOM_STATE, max_iter=5000)),
+])
+lasso_param_grid = {'model__alpha': [0.0005, 0.001, 0.005, 0.01, 0.05]}
+
+lasso_grid = GridSearchCV(lasso_pipe, lasso_param_grid, cv=5, scoring='r2', n_jobs=-1)
+lasso_grid.fit(X_train, y_train)
+
+print('Best Lasso alpha:', lasso_grid.best_params_, '  CV R2:', round(lasso_grid.best_score_, 4))
+results.append(eval_model('Lasso (tuned)', lasso_grid.best_estimator_, X_train, y_train, X_test, y_test, y_test_d))
+
+# ---- Model 4: Random Forest Regressor (non-linear benchmark) ----------------
+rf_pipe = Pipeline([
+    ('prep', preprocessor),
+    ('model', RandomForestRegressor(n_estimators=150, max_depth=18,
+                                     min_samples_leaf=3, random_state=RANDOM_STATE, n_jobs=-1)),
+])
+results.append(eval_model('RandomForest', rf_pipe, X_train, y_train, X_test, y_test, y_test_d))
+
+results_df = pd.DataFrame(results)[
+    ['name', 'r2_log_train', 'r2_log_test', 'r2_dollar_test', 'rmse_dollar_test', 'mae_dollar_test']
+]
+results_df.columns = ['Model', 'R2 (log, train)', 'R2 (log, test)', 'R2 ($, test)',
+                       'RMSE ($, test)', 'MAE ($, test)']
+print('\n--- Model comparison (pre-polynomial) ---')
+print(results_df)
+
+fig, ax = plt.subplots(figsize=(10, 6))
+sns.barplot(data=results_df, x='Model', y='R2 ($, test)', ax=ax, palette='viridis')
+ax.set_title('Test R-squared (dollar scale) by Model')
+ax.set_ylim(0, 1)
+for p in ax.patches:
+    ax.annotate(f'{p.get_height():.3f}', (p.get_x() + p.get_width() / 2, p.get_height()),
+                ha='center', va='bottom')
+plt.tight_layout()
+savefig('05_model_comparison_r2.png')
+
+print("""
+Exploring an additional degree of model complexity: Polynomial features on
+numeric predictors + Ridge. To check whether non-linear terms on the numeric
+predictors (age, odometer, cylinders) meaningfully improve fit beyond what
+Ridge/Lasso capture linearly, degree-2 polynomial and interaction terms are
+added to the numeric block only, and Ridge's regularization strength is
+re-tuned.
+""")
+
+poly_preprocessor = ColumnTransformer(transformers=[
+    ('num', Pipeline([
+        ('poly', PolynomialFeatures(degree=2, include_bias=False)),
+        ('scale', StandardScaler()),
+    ]), numeric_features),
+    ('cat', OneHotEncoder(handle_unknown='ignore', sparse=True), categorical_features),
+])
+
+poly_ridge_pipe = Pipeline([
+    ('prep', poly_preprocessor),
+    ('model', Ridge(random_state=RANDOM_STATE)),
+])
+poly_param_grid = {'model__alpha': [0.1, 1.0, 10.0, 50.0]}
+
+poly_grid = GridSearchCV(poly_ridge_pipe, poly_param_grid, cv=5, scoring='r2', n_jobs=-1)
+poly_grid.fit(X_train, y_train)
+
+print('Best Poly+Ridge alpha:', poly_grid.best_params_, '  CV R2:', round(poly_grid.best_score_, 4))
+results.append(eval_model('Poly(2)+Ridge', poly_grid.best_estimator_, X_train, y_train, X_test, y_test, y_test_d))
+
+results_df = pd.DataFrame(results)[
+    ['name', 'r2_log_train', 'r2_log_test', 'r2_dollar_test', 'rmse_dollar_test', 'mae_dollar_test']
+]
+results_df.columns = ['Model', 'R2 (log, train)', 'R2 (log, test)', 'R2 ($, test)',
+                       'RMSE ($, test)', 'MAE ($, test)']
+print('\n--- Model comparison (incl. Poly(2)+Ridge) ---')
+print(results_df)
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+section('EVALUATION')
+
+# Select the best-performing *linear* model (for interpretability) by test R2 ($)
+linear_results = [r for r in results if r['name'] in ('LinearRegression', 'Ridge (tuned)',
+                                                        'Lasso (tuned)', 'Poly(2)+Ridge')]
+best_linear = max(linear_results, key=lambda r: r['r2_dollar_test'])
+print('Best interpretable (linear-family) model:', best_linear['name'],
+      ' R2($,test)=', round(best_linear['r2_dollar_test'], 3))
+
+best_pipe = best_linear['pipe']
+
+# ---- Extract & interpret coefficients from the best linear-family model -----
+ohe = best_pipe.named_steps['prep'].named_transformers_['cat']
+cat_feature_names = get_feature_names_compat(ohe, categorical_features)
+
+# numeric feature names depend on whether this is the poly or plain preprocessor
+num_step = best_pipe.named_steps['prep'].named_transformers_['num']
+if hasattr(num_step, 'named_steps'):   # PolynomialFeatures + Scaler pipeline
+    poly_step = num_step.named_steps['poly']
+    num_feature_names = get_feature_names_compat(poly_step, numeric_features)
+else:
+    num_feature_names = numeric_features
+
+all_feature_names = list(num_feature_names) + cat_feature_names
+coefs = best_pipe.named_steps['model'].coef_
+
+coef_df = (pd.DataFrame({'feature': all_feature_names, 'coef_log_price': coefs})
+           .assign(abs_coef=lambda d: d['coef_log_price'].abs())
+           .sort_values('abs_coef', ascending=False))
+
+print(f'\nTotal features (incl. one-hot dummies): {len(coef_df)}')
+print(coef_df.head(25))
+
+top_n = 25
+fig, ax = plt.subplots(figsize=(10, 9))
+plot_df = coef_df.head(top_n).sort_values('coef_log_price')
+colors = ['firebrick' if v < 0 else 'seagreen' for v in plot_df['coef_log_price']]
+ax.barh(plot_df['feature'], plot_df['coef_log_price'], color=colors)
+ax.set_xlabel('Coefficient on log(1 + price)')
+ax.set_title(f'Top {top_n} Price Drivers -- {best_linear["name"]}\n'
+             '(positive = higher price, negative = lower price, holding other features constant)')
+ax.axvline(0, color='black', linewidth=0.8)
+plt.tight_layout()
+savefig('06_top_price_drivers.png')
+
+# ---- Residual analysis for the chosen model ----------------------------------
+pred_log_test = best_pipe.predict(X_test)
+pred_dollars_test = np.expm1(pred_log_test)
+residuals = y_test_d.values - pred_dollars_test
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+axes[0].scatter(pred_dollars_test, residuals, alpha=0.1, s=8)
+axes[0].axhline(0, color='red', linestyle='--')
+axes[0].set_xlabel('Predicted Price ($)')
+axes[0].set_ylabel('Residual ($)')
+axes[0].set_title('Residuals vs. Predicted Price')
+axes[0].set_xlim(0, 60000)
+axes[0].set_ylim(-30000, 30000)
+
+sns.histplot(residuals[np.abs(residuals) < 30000], bins=60, ax=axes[1], color='slateblue')
+axes[1].set_title('Residual Distribution')
+axes[1].set_xlabel('Residual ($)')
+plt.tight_layout()
+savefig('07_residual_analysis.png')
+
+# ---- Cross-check: Random Forest feature importances vs. linear coefficients -
+rf_model = results[3]['pipe']  # RandomForest, as fitted above
+rf_ohe = rf_model.named_steps['prep'].named_transformers_['cat']
+rf_cat_names = get_feature_names_compat(rf_ohe, categorical_features)
+rf_all_names = numeric_features + rf_cat_names
+
+rf_importances = pd.DataFrame({
+    'feature': rf_all_names,
+    'importance': rf_model.named_steps['model'].feature_importances_,
+}).sort_values('importance', ascending=False)
+
+fig, ax = plt.subplots(figsize=(10, 8))
+plot_df = rf_importances.head(20).sort_values('importance')
+ax.barh(plot_df['feature'], plot_df['importance'], color='teal')
+ax.set_title('Top 20 Feature Importances -- Random Forest (non-linear benchmark)')
+ax.set_xlabel('Importance')
+plt.tight_layout()
+savefig('08_rf_feature_importances.png')
+
+print("""
+Evaluation summary:
+- Regularized linear models (Ridge / Lasso) perform essentially on par with plain
+  Linear Regression once the dataset has been cleaned -- multicollinearity among the
+  one-hot dummy columns was not severely degrading the unregularized model.
+- Adding degree-2 polynomial terms on the numeric predictors gives a modest R2
+  improvement over the plain linear models, indicating some non-linearity/interaction
+  in how vehicle age and mileage jointly affect price.
+- The Random Forest benchmark achieves meaningfully higher R2 than any linear-family
+  model, confirming non-linear/interaction effects exist that linear models can't fully
+  capture. The best linear-family model is retained as the primary explanatory tool for
+  interpretability, with RF importances used as an independent cross-check.
+- Top features identified by linear coefficients (age/year, odometer, specific
+  manufacturers, condition, fuel=diesel, drive=4wd) are broadly corroborated by the
+  Random Forest's independent feature-importance ranking.
+- Residual plots show reasonably well-behaved, roughly symmetric residuals around zero
+  for mid-range prices, with higher variance at the low/high ends of the price range.
+- Data Preparation choices (dropping model/region, bucketing missing categoricals as
+  'unknown', log-transforming price/odometer, capping outliers) were validated by the
+  fact that even simple Linear Regression achieves a reasonable, stable R2.
+""")
+
+# ---------------------------------------------------------------------------
+# Deployment
+# ---------------------------------------------------------------------------
+section('DEPLOYMENT / REPORT FOR THE DEALERSHIP')
+
+print("""
+Report for the Dealership: What Drives Used-Car Prices?
+
+Approach (in brief): ~426,000 used-vehicle listings were analyzed. The data was
+cleaned to remove erroneous/outlier entries, a vehicle-age feature was engineered,
+and several regression models (Linear, Ridge, Lasso, a polynomial-term model, and a
+Random Forest benchmark) were trained to identify which vehicle attributes most
+reliably move price up or down -- all while holding other factors constant.
+
+Key Takeaways for Inventory & Pricing Decisions:
+
+1. Age is the single strongest price driver. Every additional year of vehicle age is
+   associated with a substantial, consistent drop in price.
+
+2. Mileage matters -- but its effect compounds with age. The price penalty for high
+   mileage is steeper on newer cars than on older ones.
+
+3. Manufacturer brand tier has a large, persistent effect. Premium/luxury marques
+   command a premium; budget/economy brands sit at a discount.
+
+4. Condition and title status are strong, actionable signals. "Excellent"/"like new"
+   condition and clean titles carry meaningful premiums.
+
+5. Drivetrain and fuel type carry notable premiums. 4WD and diesel vehicles price
+   higher than FWD/RWD and gas/other, respectively.
+
+6. Vehicle body type matters for positioning inventory. Pickups/trucks/SUVs tend to
+   price higher than sedans/hatchbacks/coupes of comparable age and mileage.
+
+7. Missing/unknown attribute levels are themselves informative -- incomplete listings
+   tend to sell at different (generally lower) price points.
+
+Recommended Next Steps:
+- Use the fitted model's predicted price as a pricing sanity-check tool.
+- Prioritize sourcing vehicles with the strongest positive price drivers identified
+  above, subject to acquisition cost.
+- Track model performance over time and refresh training data periodically.
+- Consider interaction effects between manufacturer and type, and regional price
+  variation, as follow-up analysis.
+""")
+
+print(f'\nAll plots have been saved to: {PLOT_DIR}')
+print('Script completed successfully.')
